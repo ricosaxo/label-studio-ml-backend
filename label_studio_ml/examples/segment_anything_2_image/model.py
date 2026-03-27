@@ -21,13 +21,21 @@ MODEL_CONFIG = os.getenv('MODEL_CONFIG', 'configs/sam2.1/sam2.1_hiera_l.yaml')
 MODEL_CHECKPOINT = os.getenv('MODEL_CHECKPOINT', 'sam2.1_hiera_large.pt')
 
 if DEVICE == 'cuda':
-    # use bfloat16 for the entire notebook
-    torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
-
+    # Stabiliteitsmodus voor nieuwe GPU-architecturen (incl. Blackwell sm_120):
+    # forceer veilige math-kernel i.p.v. flash/mem-efficient SDP variants.
+    try:
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+    except Exception:
+        pass
     if torch.cuda.get_device_properties(0).major >= 8:
-        # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+        # tf32 voor Ampere/Hopper/Blackwell – veilige precision-versnelling
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+    # GEEN globale torch.autocast().__enter__() hier: dat corrompeert de CUDA-staat
+    # van de gunicorn-worker en veroorzaakt een SIGSEGV op Blackwell ~12s na startup.
+    # autocast wordt per-predict aangewend in _sam_predict().
 
 
 # build path to the model checkpoint
@@ -87,12 +95,21 @@ class NewModel(LabelStudioMLBase):
         point_labels = np.array(point_labels, dtype=np.float32) if point_labels else None
         input_box = np.array(input_box, dtype=np.float32) if input_box else None
 
-        masks, scores, logits = predictor.predict(
-            point_coords=point_coords,
-            point_labels=point_labels,
-            box=input_box,
-            multimask_output=True
-        )
+        # autocast scoped per-predict: bfloat16 op CUDA, float32 fallback op CPU.
+        # Globale autocast.__enter__() op module-niveau is verwijderd (SIGSEGV-fix).
+        if DEVICE == 'cuda':
+            ctx = torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+        else:
+            import contextlib
+            ctx = contextlib.nullcontext()
+
+        with torch.inference_mode(), ctx:
+            masks, scores, logits = predictor.predict(
+                point_coords=point_coords,
+                point_labels=point_labels,
+                box=input_box,
+                multimask_output=True
+            )
         sorted_ind = np.argsort(scores)[::-1]
         masks = masks[sorted_ind]
         scores = scores[sorted_ind]
@@ -108,11 +125,18 @@ class NewModel(LabelStudioMLBase):
     def predict(self, tasks: List[Dict], context: Optional[Dict] = None, **kwargs) -> ModelResponse:
         """ Returns the predicted mask for a smart keypoint that has been placed."""
 
-        from_name, to_name, value = self.get_first_tag_occurence('BrushLabels', 'Image')
+        # Hardcoded fallback: label_interface is only set after a /setup call from Label Studio,
+        # which does not happen on container restarts. These values match the project labeling config.
+        try:
+            from_name, to_name, value = self.get_first_tag_occurence('BrushLabels', 'Image')
+        except AttributeError:
+            from_name, to_name, value = 'tag', 'image', 'image'
 
         if not context or not context.get('result'):
-            # if there is no context, no interaction has happened yet
-            return ModelResponse(predictions=[])
+            # No interaction yet: return a valid empty prediction so Label Studio doesn't
+            # log an error about "results field must be a list with at least one item".
+            # An empty result list is valid; an empty predictions list is not.
+            return ModelResponse(predictions=[{'result': [], 'score': 0.0}])
 
         image_width = context['result'][0]['original_width']
         image_height = context['result'][0]['original_height']
