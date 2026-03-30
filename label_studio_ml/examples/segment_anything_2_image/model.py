@@ -2,7 +2,8 @@ import torch
 import numpy as np
 import os
 import sys
-import pathlib
+import base64
+from io import BytesIO
 from typing import List, Dict, Optional
 from uuid import uuid4
 from label_studio_ml.model import LabelStudioMLBase
@@ -84,8 +85,13 @@ class NewModel(LabelStudioMLBase):
         }]
 
     def set_image(self, image_url, task_id):
-        image_path = self.get_local_path(image_url, task_id=task_id)
-        image = Image.open(image_path)
+        # Support zowel file/http URLs als data:image/...;base64 payloads uit tests.
+        if isinstance(image_url, str) and image_url.startswith('data:image'):
+            _, b64_data = image_url.split(',', 1)
+            image = Image.open(BytesIO(base64.b64decode(b64_data)))
+        else:
+            image_path = self.get_local_path(image_url, task_id=task_id)
+            image = Image.open(image_path)
         image = np.array(image.convert("RGB"))
         predictor.set_image(image)
 
